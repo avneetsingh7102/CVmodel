@@ -1,0 +1,765 @@
+import os
+import io
+import time
+import base64
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from PIL import Image
+import numpy as np
+import cv2
+
+from model_loader import ResNet50CIFAR100Predictor
+from cifar100_labels import CIFAR100_CLASSES, get_display_name, get_superclass_name
+
+# Initialize FastAPI App
+app = FastAPI(
+    title="ResNet-50 CIFAR-100 Live Computer Vision Studio",
+    description="Real-time Computer Vision Web Studio powered by fine-tuned PyTorch ResNet-50 model."
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global Predictor Instance
+predictor = None
+
+@app.on_event("startup")
+def load_model_on_startup():
+    global predictor
+    print("[WebApp] Loading ResNet-50 CIFAR-100 PyTorch model on server startup...")
+    predictor = ResNet50CIFAR100Predictor(model_path='resnet50_cifar100_finetuned.pth')
+    print(f"[WebApp] Model loaded successfully on device: {predictor.device}")
+
+class ImagePayload(BaseModel):
+    image: str
+    top_k: int = 5
+
+@app.get("/api/info")
+def get_info():
+    return {
+        "status": "online",
+        "model": "ResNet-50 (CIFAR-100 Fine-Tuned)",
+        "device": str(predictor.device) if predictor else "initializing",
+        "num_classes": len(CIFAR100_CLASSES)
+    }
+
+@app.get("/api/classes")
+def get_classes():
+    items = []
+    for idx, c in enumerate(CIFAR100_CLASSES):
+        items.append({
+            "index": idx,
+            "name": c,
+            "display_name": get_display_name(idx),
+            "superclass": get_superclass_name(c)
+        })
+    return {"total": len(items), "classes": items}
+
+@app.post("/api/predict")
+def predict_frame(payload: ImagePayload):
+    if predictor is None:
+        raise HTTPException(status_code=503, detail="Model is still initializing")
+    try:
+        t0 = time.time()
+        res = predictor.predict_base64(payload.image, top_k=payload.top_k)
+        latency_ms = round((time.time() - t0) * 1000, 2)
+        res["latency_ms"] = latency_ms
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    if predictor is None:
+        raise HTTPException(status_code=503, detail="Model is still initializing")
+    try:
+        contents = await file.read()
+        pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
+        rgb_np = np.array(pil_img)
+        bgr_np = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
+        
+        t0 = time.time()
+        res = predictor.predict(bgr_np, top_k=5)
+        latency_ms = round((time.time() - t0) * 1000, 2)
+        res["latency_ms"] = latency_ms
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTML_UI_CONTENT
+
+HTML_UI_CONTENT = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ResNet-50 Live Computer Vision Studio</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #090d16;
+            --card-bg: rgba(18, 24, 38, 0.75);
+            --card-border: rgba(255, 255, 255, 0.08);
+            --primary: #38bdf8;
+            --primary-glow: rgba(56, 189, 248, 0.35);
+            --accent: #6366f1;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.12) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, rgba(99, 102, 241, 0.12) 0px, transparent 50%);
+            background-attachment: fixed;
+            overflow-x: hidden;
+        }
+
+        /* Header Navigation */
+        header {
+            padding: 1.25rem 2rem;
+            border-bottom: 1px solid var(--card-border);
+            backdrop-filter: blur(16px);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            background: rgba(9, 13, 22, 0.8);
+        }
+
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 0 20px var(--primary-glow);
+        }
+
+        .logo-icon svg {
+            width: 24px;
+            height: 24px;
+            fill: white;
+        }
+
+        .logo-text h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.35rem;
+            font-weight: 700;
+            background: linear-gradient(90deg, #fff, var(--primary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .logo-text p {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .badge-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--card-border);
+            padding: 0.4rem 0.85rem;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success);
+            box-shadow: 0 0 10px var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.85); }
+        }
+
+        /* App Container Layout */
+        .container {
+            max-width: 1400px;
+            width: 100%;
+            margin: 2rem auto;
+            padding: 0 1.5rem;
+            display: grid;
+            grid-template-columns: 1fr 420px;
+            gap: 2rem;
+            flex: 1;
+        }
+
+        @media (max-width: 1024px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .glass-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 20px;
+            padding: 1.5rem;
+            backdrop-filter: blur(12px);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Camera Viewport Section */
+        .viewport-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1rem;
+        }
+
+        .viewport-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.15rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .controls-bar {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+        }
+
+        .btn {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid var(--card-border);
+            color: var(--text-main);
+            padding: 0.6rem 1.1rem;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            transition: all 0.2s ease;
+        }
+
+        .btn:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border-color: rgba(255, 255, 255, 0.2);
+            transform: translateY(-1px);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            border: none;
+            color: white;
+            box-shadow: 0 4px 15px var(--primary-glow);
+        }
+
+        .btn-primary:hover {
+            box-shadow: 0 6px 20px var(--primary-glow);
+            opacity: 0.95;
+        }
+
+        .btn-active {
+            background: rgba(16, 185, 129, 0.2);
+            border-color: var(--success);
+            color: var(--success);
+        }
+
+        .tab-group {
+            display: flex;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 4px;
+            border-radius: 12px;
+            border: 1px solid var(--card-border);
+        }
+
+        .tab-btn {
+            padding: 0.45rem 0.9rem;
+            border-radius: 8px;
+            border: none;
+            background: transparent;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .tab-btn.active {
+            background: rgba(255, 255, 255, 0.1);
+            color: var(--text-main);
+        }
+
+        .video-wrapper {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            background: #000;
+            border-radius: 16px;
+            overflow: hidden;
+            border: 1px solid var(--card-border);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        video, canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        /* HUD Target Bounding Box */
+        .hud-target-box {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 260px;
+            height: 260px;
+            border: 2px dashed rgba(56, 189, 248, 0.6);
+            border-radius: 16px;
+            pointer-events: none;
+            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.25);
+            transition: border-color 0.3s;
+        }
+
+        .hud-target-label {
+            position: absolute;
+            top: -25px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(56, 189, 248, 0.85);
+            color: #000;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 4px;
+            text-transform: uppercase;
+        }
+
+        /* Dropzone view */
+        .dropzone {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border: 2px dashed var(--card-border);
+            border-radius: 16px;
+            padding: 2rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .dropzone:hover {
+            border-color: var(--primary);
+            background: rgba(56, 189, 248, 0.05);
+        }
+
+        /* Predictions Panel */
+        .panel-header {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.15rem;
+            font-weight: 600;
+            margin-bottom: 1.25rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .top-pred-card {
+            background: linear-gradient(135deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.9));
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            border-radius: 16px;
+            padding: 1.25rem;
+            margin-bottom: 1.5rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .top-pred-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 5px;
+            height: 100%;
+            background: linear-gradient(180deg, var(--primary), var(--accent));
+        }
+
+        .pred-meta {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--primary);
+            font-family: 'JetBrains Mono', monospace;
+            margin-bottom: 0.35rem;
+        }
+
+        .pred-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.6rem;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 0.25rem;
+        }
+
+        .pred-superclass {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 1rem;
+        }
+
+        .confidence-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            background: rgba(56, 189, 248, 0.15);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            color: var(--primary);
+            padding: 0.35rem 0.85rem;
+            border-radius: 999px;
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        /* Top 5 List */
+        .top5-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.85rem;
+        }
+
+        .bar-item {
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+        }
+
+        .bar-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+        }
+
+        .bar-name {
+            font-weight: 500;
+            color: var(--text-main);
+        }
+
+        .bar-percent {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+
+        .bar-track {
+            width: 100%;
+            height: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .bar-fill {
+            height: 100%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, var(--primary), var(--accent));
+            width: 0%;
+            transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .bar-item:first-child .bar-fill {
+            background: linear-gradient(90deg, #38bdf8, #10b981);
+        }
+
+        /* Footer */
+        footer {
+            padding: 1.5rem;
+            text-align: center;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            border-top: 1px solid var(--card-border);
+            margin-top: auto;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="logo-container">
+            <div class="logo-icon">
+                <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-9l6 4.5-6 4.5z"/></svg>
+            </div>
+            <div class="logo-text">
+                <h1>ResNet-50 Vision Studio</h1>
+                <p>Fine-Tuned PyTorch CIFAR-100 Computer Vision Classifier</p>
+            </div>
+        </div>
+        <div class="badge-status">
+            <div class="status-dot"></div>
+            <span id="deviceTag">DEVICE: LOADING..</span>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- Left Column: Camera / Upload Viewport -->
+        <div class="glass-card">
+            <div class="viewport-header">
+                <div class="viewport-title">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                    Live Vision Feed
+                </div>
+                <div class="controls-bar">
+                    <div class="tab-group">
+                        <button class="tab-btn active" id="tabWebcam" onclick="switchMode('webcam')">Webcam</button>
+                        <button class="tab-btn" id="tabUpload" onclick="switchMode('upload')">Upload Image</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Webcam Mode Container -->
+            <div id="webcamContainer" style="display: flex; flex-direction: column; gap: 1rem; flex: 1;">
+                <div class="video-wrapper">
+                    <video id="videoElement" autoplay playsinline></video>
+                    <canvas id="canvasElement" style="display:none;"></canvas>
+                    <div class="hud-target-box">
+                        <div class="hud-target-label">ResNet Crop Zone</div>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 0.75rem; justify-content: space-between; align-items: center;">
+                    <button class="btn btn-primary" id="btnPredictFrame" onclick="captureAndPredict()">
+                        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path><circle cx="12" cy="13" r="3"></circle></svg>
+                        Predict Frame
+                    </button>
+                    <button class="btn" id="btnToggleRealtime" onclick="toggleRealtime()">
+                        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                        Real-Time: <span id="realtimeStatus">OFF</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Upload Mode Container -->
+            <div id="uploadContainer" style="display: none; flex-direction: column; gap: 1rem; flex: 1;">
+                <div class="video-wrapper">
+                    <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+                        <svg width="48" height="48" fill="none" stroke="var(--primary)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                        <p style="margin-top: 1rem; font-weight: 500;">Click or Drag image file to classify</p>
+                        <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem;">Supports PNG, JPG, JPEG, WEBP</p>
+                    </div>
+                    <img id="uploadPreview" style="display:none; width:100%; height:100%; object-fit:contain;">
+                </div>
+                <input type="file" id="fileInput" accept="image/*" style="display:none;" onchange="handleFileUpload(event)">
+            </div>
+        </div>
+
+        <!-- Right Column: Predictions & Stats Panel -->
+        <div class="glass-card">
+            <div class="panel-header">
+                Classification Output
+                <span id="latencyTag" style="font-size: 0.75rem; font-family: 'JetBrains Mono'; color: var(--text-muted);">0 ms</span>
+            </div>
+
+            <!-- Top Prediction Highlight -->
+            <div class="top-pred-card">
+                <div class="pred-meta">TOP PREDICTION</div>
+                <div class="pred-title" id="topPredTitle">Awaiting Input</div>
+                <div class="pred-superclass" id="topPredSuper">Press 'Predict Frame' to analyze</div>
+                <div class="confidence-pill" id="topPredConf">0.0% CONFIDENCE</div>
+            </div>
+
+            <!-- Top 5 Bar Chart -->
+            <div style="font-family: 'Outfit'; font-size: 0.95rem; font-weight: 600; margin-bottom: 1rem;">
+                Top 5 Probabilities
+            </div>
+            <div class="top5-list" id="top5List">
+                <div style="color: var(--text-muted); font-size: 0.85rem; text-align: center; padding: 2rem 0;">
+                    No classification results yet.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        ResNet-50 PyTorch CIFAR-100 Fine-Tuned Model • Computer Vision Studio
+    </footer>
+
+    <script>
+        let video = document.getElementById('videoElement');
+        let canvas = document.getElementById('canvasElement');
+        let isRealtime = false;
+        let realtimeTimer = null;
+
+        // Fetch Server Info
+        async function fetchInfo() {
+            try {
+                let res = await fetch('/api/info');
+                let data = await res.json();
+                document.getElementById('deviceTag').innerText = `DEVICE: ${data.device.toUpperCase()}`;
+            } catch(e) {
+                document.getElementById('deviceTag').innerText = 'DEVICE: OFFLINE';
+            }
+        }
+        fetchInfo();
+
+        // Start Webcam
+        async function startWebcam() {
+            try {
+                let stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+                video.srcObject = stream;
+            } catch(e) {
+                console.error("Webcam error:", e);
+                alert("Could not access camera. Please allow webcam permissions.");
+            }
+        }
+        startWebcam();
+
+        function switchMode(mode) {
+            document.getElementById('tabWebcam').classList.toggle('active', mode === 'webcam');
+            document.getElementById('tabUpload').classList.toggle('active', mode === 'upload');
+            document.getElementById('webcamContainer').style.display = mode === 'webcam' ? 'flex' : 'none';
+            document.getElementById('uploadContainer').style.display = mode === 'upload' ? 'flex' : 'none';
+
+            if (mode === 'upload' && isRealtime) {
+                toggleRealtime();
+            }
+        }
+
+        async function captureAndPredict() {
+            if (!video.videoWidth) return;
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            let ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            let dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+
+            try {
+                let res = await fetch('/api/predict', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: dataUrl, top_k: 5 })
+                });
+                let data = await res.json();
+                renderPredictions(data);
+            } catch(e) {
+                console.error("Prediction error:", e);
+            }
+        }
+
+        function toggleRealtime() {
+            isRealtime = !isRealtime;
+            document.getElementById('realtimeStatus').innerText = isRealtime ? 'ON' : 'OFF';
+            document.getElementById('btnToggleRealtime').classList.toggle('btn-active', isRealtime);
+
+            if (isRealtime) {
+                realtimeTimer = setInterval(captureAndPredict, 300);
+            } else {
+                clearInterval(realtimeTimer);
+            }
+        }
+
+        async function handleFileUpload(event) {
+            let file = event.target.files[0];
+            if (!file) return;
+
+            let reader = new FileReader();
+            reader.onload = function(e) {
+                let img = document.getElementById('uploadPreview');
+                img.src = e.target.result;
+                img.style.display = 'block';
+                document.getElementById('dropzone').style.display = 'none';
+            };
+            reader.readAsDataURL(file);
+
+            let formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                let res = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                let data = await res.json();
+                renderPredictions(data);
+            } catch(e) {
+                console.error("Upload error:", e);
+            }
+        }
+
+        function renderPredictions(data) {
+            document.getElementById('latencyTag').innerText = `${data.latency_ms} ms`;
+            let top = data.top_prediction;
+
+            document.getElementById('topPredTitle').innerText = top.display_name;
+            document.getElementById('topPredSuper').innerText = `Category: ${top.superclass}`;
+            document.getElementById('topPredConf').innerText = `${top.confidence.toFixed(1)}% CONFIDENCE`;
+
+            let html = '';
+            data.top_k.forEach((item, i) => {
+                html += `
+                    <div class="bar-item">
+                        <div class="bar-labels">
+                            <span class="bar-name">${i+1}. ${item.display_name}</span>
+                            <span class="bar-percent">${item.confidence.toFixed(1)}%</span>
+                        </div>
+                        <div class="bar-track">
+                            <div class="bar-fill" style="width: ${item.confidence}%"></div>
+                        </div>
+                    </div>
+                `;
+            });
+            document.getElementById('top5List').innerHTML = html;
+        }
+    </script>
+</body>
+</html>
+"""
